@@ -1,5 +1,5 @@
-openai
-tiktoken==0.4.0
+openai<1
+tiktoken>=0.8.0
 tqdm
 langcodes
 backoff

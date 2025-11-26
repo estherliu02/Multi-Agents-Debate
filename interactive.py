@@ -20,6 +20,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import os
 import json
 import random
+import sys
+from io import StringIO
 # random.seed(0)
 from code.utils.agent import Agent
 
@@ -32,8 +34,25 @@ NAME_LIST=[
     "Moderator",
 ]
 
+
+class TeeOutput:
+    """A class to write output to multiple streams simultaneously"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
 class DebatePlayer(Agent):
-    def __init__(self, model_name: str, name: str, temperature:float, openai_api_key: str, sleep_time: float) -> None:
+    def __init__(self, model_name: str, name: str, temperature: float, openai_api_key: str, sleep_time: float) -> None:
         """Create a player in the debate
 
         Args:
@@ -43,20 +62,21 @@ class DebatePlayer(Agent):
             openai_api_key (str): As the parameter name suggests
             sleep_time (float): sleep because of rate limits
         """
-        super(DebatePlayer, self).__init__(model_name, name, temperature, sleep_time)
+        super(DebatePlayer, self).__init__(
+            model_name, name, temperature, sleep_time)
         self.openai_api_key = openai_api_key
 
 
 class Debate:
     def __init__(self,
-            model_name: str='gpt-3.5-turbo', 
-            temperature: float=0, 
-            num_players: int=3, 
-            openai_api_key: str=None,
-            config: dict=None,
-            max_round: int=3,
-            sleep_time: float=0
-        ) -> None:
+                 model_name: str = 'gpt-3.5-turbo',
+                 temperature: float = 0,
+                 num_players: int = 3,
+                 openai_api_key: str = None,
+                 config: dict = None,
+                 max_round: int = 3,
+                 sleep_time: float = 0
+                 ) -> None:
         """Create a debate
 
         Args:
@@ -76,16 +96,23 @@ class Debate:
         self.max_round = max_round
         self.sleep_time = sleep_time
 
+        # Initialize output capture
+        self.output_buffer = StringIO()
+        self.original_stdout = sys.stdout
+
+        # Start capturing output immediately
+        sys.stdout = TeeOutput(self.original_stdout, self.output_buffer)
+
         self.init_prompt()
 
         # creat&init agents
         self.creat_agents()
         self.init_agents()
 
-
     def init_prompt(self):
         def prompt_replace(key):
-            self.config[key] = self.config[key].replace("##debate_topic##", self.config["debate_topic"])
+            self.config[key] = self.config[key].replace(
+                "##debate_topic##", self.config["debate_topic"])
         prompt_replace("player_meta_prompt")
         prompt_replace("moderator_meta_prompt")
         prompt_replace("affirmative_prompt")
@@ -105,7 +132,7 @@ class Debate:
         self.affirmative.set_meta_prompt(self.config['player_meta_prompt'])
         self.negative.set_meta_prompt(self.config['player_meta_prompt'])
         self.moderator.set_meta_prompt(self.config['moderator_meta_prompt'])
-        
+
         # start: first round debate, state opinions
         print(f"===== Debate Round-1 =====\n")
         self.affirmative.add_event(self.config['affirmative_prompt'])
@@ -113,11 +140,13 @@ class Debate:
         self.affirmative.add_memory(self.aff_ans)
         self.config['base_answer'] = self.aff_ans
 
-        self.negative.add_event(self.config['negative_prompt'].replace('##aff_ans##', self.aff_ans))
+        self.negative.add_event(
+            self.config['negative_prompt'].replace('##aff_ans##', self.aff_ans))
         self.neg_ans = self.negative.ask()
         self.negative.add_memory(self.neg_ans)
 
-        self.moderator.add_event(self.config['moderator_prompt'].replace('##aff_ans##', self.aff_ans).replace('##neg_ans##', self.neg_ans).replace('##round##', 'first'))
+        self.moderator.add_event(self.config['moderator_prompt'].replace(
+            '##aff_ans##', self.aff_ans).replace('##neg_ans##', self.neg_ans).replace('##round##', 'first'))
         self.mod_ans = self.moderator.ask()
         self.moderator.add_memory(self.mod_ans)
         self.mod_ans = eval(self.mod_ans)
@@ -138,6 +167,27 @@ class Debate:
         print(self.config["debate_answer"])
         print("\n----- Debate Reason -----")
         print(self.config["Reason"])
+
+        # Save results to file
+        self.save_results()
+
+    def save_results(self):
+        """Save debate results to a file in the results directory"""
+        # Create filename from debate topic (replace spaces with underscores)
+        filename = self.config["debate_topic"].replace(" ", "_") + ".txt"
+        filepath = "/Volumes/TOSHIBA/MAD/results/" + filename
+
+        # Ensure the results directory exists
+        os.makedirs("/Volumes/TOSHIBA/MAD/results", exist_ok=True)
+
+        # Get all captured output
+        all_output = self.output_buffer.getvalue()
+
+        # Write all output to file
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(all_output)
+
+        print(f"\nResults saved to: {filepath}")
 
     def broadcast(self, msg: str):
         """Broadcast a message to all players. 
@@ -169,7 +219,6 @@ class Debate:
         player.add_memory(ans)
         self.speak(player.name, ans)
 
-
     def run(self):
 
         for round in range(self.max_round - 1):
@@ -178,15 +227,18 @@ class Debate:
                 break
             else:
                 print(f"===== Debate Round-{round+2} =====\n")
-                self.affirmative.add_event(self.config['debate_prompt'].replace('##oppo_ans##', self.neg_ans))
+                self.affirmative.add_event(
+                    self.config['debate_prompt'].replace('##oppo_ans##', self.neg_ans))
                 self.aff_ans = self.affirmative.ask()
                 self.affirmative.add_memory(self.aff_ans)
 
-                self.negative.add_event(self.config['debate_prompt'].replace('##oppo_ans##', self.aff_ans))
+                self.negative.add_event(
+                    self.config['debate_prompt'].replace('##oppo_ans##', self.aff_ans))
                 self.neg_ans = self.negative.ask()
                 self.negative.add_memory(self.neg_ans)
 
-                self.moderator.add_event(self.config['moderator_prompt'].replace('##aff_ans##', self.aff_ans).replace('##neg_ans##', self.neg_ans).replace('##round##', self.round_dct(round+2)))
+                self.moderator.add_event(self.config['moderator_prompt'].replace('##aff_ans##', self.aff_ans).replace(
+                    '##neg_ans##', self.neg_ans).replace('##round##', self.round_dct(round+2)))
                 self.mod_ans = self.moderator.ask()
                 self.moderator.add_memory(self.mod_ans)
                 self.mod_ans = eval(self.mod_ans)
@@ -197,14 +249,16 @@ class Debate:
 
         # ultimate deadly technique.
         else:
-            judge_player = DebatePlayer(model_name=self.model_name, name='Judge', temperature=self.temperature, openai_api_key=self.openai_api_key, sleep_time=self.sleep_time)
+            judge_player = DebatePlayer(model_name=self.model_name, name='Judge', temperature=self.temperature,
+                                        openai_api_key=self.openai_api_key, sleep_time=self.sleep_time)
             aff_ans = self.affirmative.memory_lst[2]['content']
             neg_ans = self.negative.memory_lst[2]['content']
 
             judge_player.set_meta_prompt(self.config['moderator_meta_prompt'])
 
             # extract answer candidates
-            judge_player.add_event(self.config['judge_prompt_last1'].replace('##aff_ans##', aff_ans).replace('##neg_ans##', neg_ans))
+            judge_player.add_event(self.config['judge_prompt_last1'].replace(
+                '##aff_ans##', aff_ans).replace('##neg_ans##', neg_ans))
             ans = judge_player.ask()
             judge_player.add_memory(ans)
 
@@ -212,7 +266,7 @@ class Debate:
             judge_player.add_event(self.config['judge_prompt_last2'])
             ans = judge_player.ask()
             judge_player.add_memory(ans)
-            
+
             ans = eval(ans)
             if ans["debate_answer"] != '':
                 self.config['success'] = True
@@ -221,6 +275,9 @@ class Debate:
             self.players.append(judge_player)
 
         self.print_answer()
+
+        # Restore original stdout
+        sys.stdout = self.original_stdout
 
 
 if __name__ == "__main__":
@@ -232,10 +289,10 @@ if __name__ == "__main__":
         debate_topic = ""
         while debate_topic == "":
             debate_topic = input(f"\nEnter your debate topic: ")
-            
+
         config = json.load(open(f"{MAD_path}/code/utils/config4all.json", "r"))
         config['debate_topic'] = debate_topic
 
-        debate = Debate(num_players=3, openai_api_key=openai_api_key, config=config, temperature=0, sleep_time=0)
+        debate = Debate(num_players=3, openai_api_key=openai_api_key,
+                        config=config, temperature=0, sleep_time=0)
         debate.run()
-

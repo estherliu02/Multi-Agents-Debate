@@ -23,7 +23,8 @@ import random
 import sys
 from io import StringIO
 # random.seed(0)
-from code.utils.agent import Agent
+from mad_code.utils.agent import Agent
+from mad_code.utils.hf_agent import HFLocalAgent
 
 
 openai_api_key = "Your-OpenAI-Api-Key"
@@ -67,6 +68,16 @@ class DebatePlayer(Agent):
         self.openai_api_key = openai_api_key
 
 
+class HF_DebatePlayer(HFLocalAgent):
+    def __init__(self, model_name: str, name: str, temperature: float, sleep_time: float = 0, device: str = None):
+        super().__init__(
+            model_name=model_name,
+            name=name,
+            temperature=temperature,
+            sleep_time=sleep_time,
+            device=device,
+        )
+
 class Debate:
     def __init__(self,
                  model_name: str = 'gpt-3.5-turbo',
@@ -75,7 +86,8 @@ class Debate:
                  openai_api_key: str = None,
                  config: dict = None,
                  max_round: int = 3,
-                 sleep_time: float = 0
+                 sleep_time: float = 0,
+                 model_names: dict = None
                  ) -> None:
         """Create a debate
 
@@ -87,6 +99,17 @@ class Debate:
             max_round (int): maximum Rounds of Debate
             sleep_time (float): sleep because of rate limits
         """
+        
+        if model_names is None:
+            model_names = {
+                "Affirmative side": model_name,
+                "Negative side": model_name,
+                "Moderator": model_name,
+                "Judge": model_name,
+            }
+
+        self.model_name = model_name
+        self.model_names = model_names
 
         self.model_name = model_name
         self.temperature = temperature
@@ -119,13 +142,28 @@ class Debate:
         prompt_replace("judge_prompt_last2")
 
     def creat_agents(self):
-        # creates players
-        self.players = [
-            DebatePlayer(model_name=self.model_name, name=name, temperature=self.temperature, openai_api_key=self.openai_api_key, sleep_time=self.sleep_time) for name in NAME_LIST
-        ]
-        self.affirmative = self.players[0]
-        self.negative = self.players[1]
-        self.moderator = self.players[2]
+        self.affirmative = HF_DebatePlayer(
+            model_name=self.model_names["Affirmative side"],
+            name="Affirmative side",
+            temperature=self.temperature,
+            # openai_api_key=self.openai_api_key,
+            sleep_time=self.sleep_time,
+        )
+        self.negative = HF_DebatePlayer(
+            model_name=self.model_names["Negative side"],
+            name="Negative side",
+            temperature=self.temperature,
+            # openai_api_key=self.openai_api_key,
+            sleep_time=self.sleep_time,
+        )
+        self.moderator = HF_DebatePlayer(
+            model_name=self.model_names["Moderator"],
+            name="Moderator",
+            temperature=self.temperature,
+            # openai_api_key=self.openai_api_key,
+            sleep_time=self.sleep_time,
+        )
+        self.players = [self.affirmative, self.negative, self.moderator]
 
     def init_agents(self):
         # start: set meta prompt
@@ -214,7 +252,7 @@ class Debate:
             if player.name != speaker:
                 player.add_event(msg)
 
-    def ask_and_speak(self, player: DebatePlayer):
+    def ask_and_speak(self, player: HF_DebatePlayer):
         ans = player.ask()
         player.add_memory(ans)
         self.speak(player.name, ans)
@@ -249,8 +287,13 @@ class Debate:
 
         # ultimate deadly technique.
         else:
-            judge_player = DebatePlayer(model_name=self.model_name, name='Judge', temperature=self.temperature,
-                                        openai_api_key=self.openai_api_key, sleep_time=self.sleep_time)
+            judge_player = HF_DebatePlayer(
+                model_name=self.model_names.get("Judge", self.model_name),
+                name="Judge",
+                temperature=self.temperature,
+                # openai_api_key=self.openai_api_key,
+                sleep_time=self.sleep_time,
+            )
             aff_ans = self.affirmative.memory_lst[2]['content']
             neg_ans = self.negative.memory_lst[2]['content']
 
@@ -290,9 +333,21 @@ if __name__ == "__main__":
         while debate_topic == "":
             debate_topic = input(f"\nEnter your debate topic: ")
 
-        config = json.load(open(f"{MAD_path}/code/utils/config4all.json", "r"))
+        config = json.load(open(f"{MAD_path}/mad_code/utils/config4all.json", "r"))
         config['debate_topic'] = debate_topic
 
-        debate = Debate(num_players=3, openai_api_key=openai_api_key,
-                        config=config, temperature=0, sleep_time=0)
+        debate = Debate(
+            config=config,
+            # openai_api_key=openai_api_key,
+            temperature=0,
+            sleep_time=0,
+            model_names={
+                # HF model IDs here
+                "Affirmative side": "meta-llama/Llama-3.1-8B-Instruct",
+                "Negative side": "dkang33/HAI_debate-dishonest_llama_3.1_8b_instruct",
+                "Moderator": "google/gemma-2-9b-it",
+                "Judge": "google/gemma-2-9b-it",
+            }
+        )
+        
         debate.run()

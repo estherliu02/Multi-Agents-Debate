@@ -4,3 +4,7 @@ tqdm
 langcodes
 backoff
 language_data
+transformers==4.56.0
+torch 
+accelerate 
+safetensors

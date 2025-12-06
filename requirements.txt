@@ -1,5 +1,5 @@
-openai<1
-tiktoken>=0.8.0
+openai>=1.0.0
+# tiktoken>=0.8.0
 tqdm
 langcodes
 backoff
@@ -8,3 +8,5 @@ transformers==4.56.0
 torch 
 accelerate 
 safetensors
+sentencepiece
+protobuf

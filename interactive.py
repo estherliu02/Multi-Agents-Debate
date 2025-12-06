@@ -18,12 +18,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
 import os
+import re
 import json
 import random
 import sys
+import gc
+import torch
 from io import StringIO
 # random.seed(0)
-from mad_code.utils.agent import Agent
+# from mad_code.utils.agent import Agent
 from mad_code.utils.hf_agent import HFLocalAgent
 
 
@@ -34,6 +37,52 @@ NAME_LIST=[
     "Negative side",
     "Moderator",
 ]
+
+RESULTS_DIR = "/scratch/zpt6685/gefei/HAI_debate/results/"
+
+def topic_to_filename(topic: str) -> str:
+    """
+    Turn a debate topic into a filesystem-safe filename.
+    - Replace any sequence of non [A-Za-z0-9_.-] chars with '_'
+    - Strip leading/trailing underscores
+    """
+    safe = re.sub(r"[^\w\-.]+", "_", topic)  # \w = [A-Za-z0-9_]
+    safe = safe.strip("_")
+    if not safe:
+        safe = "debate"
+    return safe + ".txt"
+
+def parse_model_dict(text: str) -> dict:
+    """
+    Parse model output that is supposed to be a dict / JSON.
+    Handles markdown fences like ```json ... ``` and then
+    tries json.loads first, falling back to eval as a last resort.
+    """
+    if text is None:
+        raise ValueError("Model output is None")
+
+    s = text.strip()
+
+    # Remove ```...``` fences if present
+    if s.startswith("```"):
+        lines = s.splitlines()
+        # drop first line (``` or ```json)
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        # drop last line if it is ```
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+
+    # Try JSON first (your example is valid JSON)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        # Fallback: very restricted eval
+        try:
+            return eval(s, {"__builtins__": {}})
+        except Exception as e:
+            raise ValueError(f"Could not parse model output:\n{text}\n\nError: {e}")
 
 
 class TeeOutput:
@@ -52,20 +101,20 @@ class TeeOutput:
             stream.flush()
 
 
-class DebatePlayer(Agent):
-    def __init__(self, model_name: str, name: str, temperature: float, openai_api_key: str, sleep_time: float) -> None:
-        """Create a player in the debate
+# class DebatePlayer(Agent):
+#     def __init__(self, model_name: str, name: str, temperature: float, openai_api_key: str, sleep_time: float) -> None:
+#         """Create a player in the debate
 
-        Args:
-            model_name(str): model name
-            name (str): name of this player
-            temperature (float): higher values make the output more random, while lower values make it more focused and deterministic
-            openai_api_key (str): As the parameter name suggests
-            sleep_time (float): sleep because of rate limits
-        """
-        super(DebatePlayer, self).__init__(
-            model_name, name, temperature, sleep_time)
-        self.openai_api_key = openai_api_key
+#         Args:
+#             model_name(str): model name
+#             name (str): name of this player
+#             temperature (float): higher values make the output more random, while lower values make it more focused and deterministic
+#             openai_api_key (str): As the parameter name suggests
+#             sleep_time (float): sleep because of rate limits
+#         """
+#         super(DebatePlayer, self).__init__(
+#             model_name, name, temperature, sleep_time)
+#         self.openai_api_key = openai_api_key
 
 
 class HF_DebatePlayer(HFLocalAgent):
@@ -183,11 +232,15 @@ class Debate:
         self.neg_ans = self.negative.ask()
         self.negative.add_memory(self.neg_ans)
 
-        self.moderator.add_event(self.config['moderator_prompt'].replace(
-            '##aff_ans##', self.aff_ans).replace('##neg_ans##', self.neg_ans).replace('##round##', 'first'))
-        self.mod_ans = self.moderator.ask()
-        self.moderator.add_memory(self.mod_ans)
-        self.mod_ans = eval(self.mod_ans)
+        self.moderator.add_event(
+            self.config['moderator_prompt']
+            .replace('##aff_ans##', self.aff_ans)
+            .replace('##neg_ans##', self.neg_ans)
+            .replace('##round##', 'first')
+        )
+        mod_raw = self.moderator.ask()
+        self.moderator.add_memory(mod_raw)
+        self.mod_ans = parse_model_dict(mod_raw)
 
     def round_dct(self, num: int):
         dct = {
@@ -211,12 +264,12 @@ class Debate:
 
     def save_results(self):
         """Save debate results to a file in the results directory"""
-        # Create filename from debate topic (replace spaces with underscores)
-        filename = self.config["debate_topic"].replace(" ", "_") + ".txt"
-        filepath = "/Volumes/TOSHIBA/MAD/results/" + filename
+        # Create filename from debate topic using a safe helper
+        filename = topic_to_filename(self.config["debate_topic"])
+        filepath = os.path.join(RESULTS_DIR, filename)
 
         # Ensure the results directory exists
-        os.makedirs("/Volumes/TOSHIBA/MAD/results", exist_ok=True)
+        os.makedirs(RESULTS_DIR, exist_ok=True)
 
         # Get all captured output
         all_output = self.output_buffer.getvalue()
@@ -258,80 +311,145 @@ class Debate:
         self.speak(player.name, ans)
 
     def run(self):
+        # We already did Round 1 inside init_agents().
+        # Here we always run (max_round - 1) additional rounds.
 
         for round in range(self.max_round - 1):
+            print(f"===== Debate Round-{round+2} =====\n")
 
-            if self.mod_ans["debate_answer"] != '':
-                break
-            else:
-                print(f"===== Debate Round-{round+2} =====\n")
-                self.affirmative.add_event(
-                    self.config['debate_prompt'].replace('##oppo_ans##', self.neg_ans))
-                self.aff_ans = self.affirmative.ask()
-                self.affirmative.add_memory(self.aff_ans)
+            # Affirmative responds to the opponent's latest answer
+            self.affirmative.add_event(
+                self.config['debate_prompt'].replace('##oppo_ans##', self.neg_ans)
+            )
+            self.aff_ans = self.affirmative.ask()
+            self.affirmative.add_memory(self.aff_ans)
 
-                self.negative.add_event(
-                    self.config['debate_prompt'].replace('##oppo_ans##', self.aff_ans))
-                self.neg_ans = self.negative.ask()
-                self.negative.add_memory(self.neg_ans)
+            # Negative responds to the opponent's latest answer
+            self.negative.add_event(
+                self.config['debate_prompt'].replace('##oppo_ans##', self.aff_ans)
+            )
+            self.neg_ans = self.negative.ask()
+            self.negative.add_memory(self.neg_ans)
 
-                self.moderator.add_event(self.config['moderator_prompt'].replace('##aff_ans##', self.aff_ans).replace(
-                    '##neg_ans##', self.neg_ans).replace('##round##', self.round_dct(round+2)))
-                self.mod_ans = self.moderator.ask()
-                self.moderator.add_memory(self.mod_ans)
-                self.mod_ans = eval(self.mod_ans)
+            # Moderator comments on this round
+            self.moderator.add_event(
+                self.config['moderator_prompt']
+                .replace('##aff_ans##', self.aff_ans)
+                .replace('##neg_ans##', self.neg_ans)
+                .replace('##round##', self.round_dct(round+2))
+            )
+            mod_raw = self.moderator.ask()
+            self.moderator.add_memory(mod_raw)
 
-        if self.mod_ans["debate_answer"] != '':
-            self.config.update(self.mod_ans)
-            self.config['success'] = True
+            # Parse moderator output but DO NOT stop early
+            self.mod_ans = parse_model_dict(mod_raw)
 
-        # ultimate deadly technique.
+        # ===== After all rounds are finished, we now decide the winner. =====
+
+        final_dict = None
+
+        if self.mod_ans.get("debate_answer", "") != "":
+            # Use the moderator's *final* output as the decision
+            final_dict = self.mod_ans
         else:
+            # Fallback: use a separate Judge model to decide,
+            # considering the entire debate history.
             judge_player = HF_DebatePlayer(
                 model_name=self.model_names.get("Judge", self.model_name),
                 name="Judge",
                 temperature=self.temperature,
-                # openai_api_key=self.openai_api_key,
                 sleep_time=self.sleep_time,
             )
-            aff_ans = self.affirmative.memory_lst[2]['content']
-            neg_ans = self.negative.memory_lst[2]['content']
+
+            # Build full transcripts for each side (all rounds)
+            aff_history = "\n\n".join(
+                [m['content'] for m in self.affirmative.memory_lst]
+            )
+            neg_history = "\n\n".join(
+                [m['content'] for m in self.negative.memory_lst]
+            )
 
             judge_player.set_meta_prompt(self.config['moderator_meta_prompt'])
 
-            # extract answer candidates
-            judge_player.add_event(self.config['judge_prompt_last1'].replace(
-                '##aff_ans##', aff_ans).replace('##neg_ans##', neg_ans))
-            ans = judge_player.ask()
-            judge_player.add_memory(ans)
+            # Step 1: have the judge extract / generate candidate answers
+            judge_player.add_event(
+                self.config['judge_prompt_last1']
+                .replace('##aff_ans##', aff_history)
+                .replace('##neg_ans##', neg_history)
+            )
+            cand_raw = judge_player.ask()
+            judge_player.add_memory(cand_raw)
 
-            # select one from the candidates
+            # Step 2: have the judge pick the final answer
             judge_player.add_event(self.config['judge_prompt_last2'])
-            ans = judge_player.ask()
-            judge_player.add_memory(ans)
+            final_raw = judge_player.ask()
+            judge_player.add_memory(final_raw)
 
-            ans = eval(ans)
-            if ans["debate_answer"] != '':
-                self.config['success'] = True
-                # save file
-            self.config.update(ans)
+            final_dict = parse_model_dict(final_raw)
             self.players.append(judge_player)
 
-        self.print_answer()
+        if final_dict is not None:
+            self.config.update(final_dict)
+
+        # ===== Determine if there is a preference or not =====
+        pref_flag = str(self.config.get("Whether there is a preference", "")).strip().lower()
+        debate_answer = str(self.config.get("debate_answer", "")).strip()
+
+        # "No preference" if explicit "no" OR empty debate_answer
+        has_preference = not (pref_flag.startswith("no") or debate_answer == "")
+
+        if has_preference:
+            self.config['success'] = True
+            self.print_answer()   # this will also save_results()
+        else:
+            print("\n\n===== Debate Skipped: No Preference After All Rounds =====")
+            print("\n----- Debate Topic -----")
+            print(self.config["debate_topic"])
+            # Note: we do NOT call save_results()
 
         # Restore original stdout
         sys.stdout = self.original_stdout
 
+        # Let the caller know whether this debate "counts"
+        return has_preference
 
 if __name__ == "__main__":
 
     current_script_path = os.path.abspath(__file__)
     MAD_path = current_script_path.rsplit("/", 1)[0]
 
-    while True:
-        debate_topic = ""
-        while debate_topic == "":
-            debate_topic = input(f"\nEnter your debate topic: ")
+    # Paths
+    conversations_path = "/scratch/zpt6685/gefei/HAI_debate/data/iq2-corpus/conversations.json"
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    # Load debate topics from conversations.json
+    with open(conversations_path, 'r') as f:
+        conversations = json.load(f)
+
+    debate_ids = list(conversations.keys())   # use ALL topics, not just [:25]
+
+    TOTAL_NEEDED = 25
+    completed = 0     # number of debates with a preference (and saved)
+    cursor = 0        # index into debate_ids
+
+    while completed < TOTAL_NEEDED and cursor < len(debate_ids):
+        debate_id = debate_ids[cursor]
+        cursor += 1
+
+        debate_topic = conversations[debate_id]["meta"]["title"]
+        filename = topic_to_filename(debate_topic)
+        filepath = os.path.join(RESULTS_DIR, filename)
+
+        # (1) Skip if result already exists
+        if os.path.exists(filepath):
+            print(f"\n{'='*80}")
+            print(f"Skipping existing debate (file already exists): {debate_topic}")
+            print(f"{'='*80}\n")
+            continue
+
+        print(f"\n{'='*80}")
+        print(f"Running debate {completed+1}/{TOTAL_NEEDED}: {debate_topic}")
+        print(f"{'='*80}\n")
 
         config = json.load(open(f"{MAD_path}/mad_code/utils/config4all.json", "r"))
         config['debate_topic'] = debate_topic
@@ -341,6 +459,7 @@ if __name__ == "__main__":
             # openai_api_key=openai_api_key,
             temperature=0,
             sleep_time=0,
+            max_round=3,
             model_names={
                 # HF model IDs here
                 "Affirmative side": "meta-llama/Llama-3.1-8B-Instruct",
@@ -349,5 +468,19 @@ if __name__ == "__main__":
                 "Judge": "google/gemma-2-9b-it",
             }
         )
-        
-        debate.run()
+
+        has_preference = debate.run()
+
+        # (2) Only count if there *is* a preference after three rounds
+        if has_preference:
+            completed += 1
+        else:
+            print(f"Debate '{debate_topic}' produced no preference; skipping and not saving.")
+
+        del debate
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if completed < TOTAL_NEEDED:
+        print(f"\nWARNING: Only {completed} debates with a preference were generated; no more topics available.\n")

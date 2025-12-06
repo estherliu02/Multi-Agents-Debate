@@ -1,10 +1,10 @@
-# code/utils/hf_agent.py
-import time
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
+# mad_code/utils/hf_agent.py
 
-# you can reuse or replace
-from .openai_utils import num_tokens_from_string, model2max_context
+import time
+from typing import Optional
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class HFLocalAgent:
@@ -12,8 +12,16 @@ class HFLocalAgent:
     Drop-in replacement for the OpenAI Agent, but runs a local HF model instead.
     """
 
-    def __init__(self, model_name: str, name: str, temperature: float, sleep_time: float = 0, device: str = None):
-        self.model_name = model_name          # e.g. "meta-llama/Meta-Llama-3-8B-Instruct"
+    def __init__(
+        self,
+        model_name: str,
+        name: str,
+        temperature: float,
+        sleep_time: float = 0.0,
+        device: Optional[str] = None,
+        tokenizer_name: Optional[str] = None,
+    ):
+        self.model_name = model_name          # e.g. "meta-llama/Meta-Llama-3.1-8B-Instruct"
         self.name = name
         self.temperature = temperature
         self.memory_lst = []
@@ -24,19 +32,45 @@ class HFLocalAgent:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
 
-        # load tokenizer + model once
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+        # ---------------- tokenizer selection ----------------
+        # tokenizer_name can be different from model_name (for fine-tunes)
+        if tokenizer_name is None:
+            tokenizer_name = model_name
+
+        # SPECIAL CASE: dishonest Llama fine-tune has broken tokenizer metadata.
+        # Use the base Llama-3.1 tokenizer instead.
+        if "hai_debate-dishonest_llama_3.1_8b_instruct" in model_name.lower():
+            print("Using base Llama-3.1 tokenizer for dishonest model...")
+            tokenizer_name = "meta-llama/Llama-3.1-8B-Instruct"
+
+        # load tokenizer FIRST so we are guaranteed to have self.tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+        # ---------------- model loading ----------------
+        # Use bfloat16 on GPU if available, otherwise default dtype on CPU
+        model_kwargs = {}
+        if device == "cuda":
+            model_kwargs["device_map"] = "auto"
+            model_kwargs["dtype"] = torch.bfloat16  # torch_dtype is deprecated
+        else:
+            model_kwargs["device_map"] = None
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="auto" if device == "cuda" else None,
-            torch_dtype=torch.bfloat16 if device == "cuda" else None,
+            **model_kwargs,
         )
         if device == "cpu":
             self.model.to(device)
 
-        # if tokenizer has no pad token, set one
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # ---------------- pad token handling ----------------
+        # Many Llama / Gemma models have no pad token; use eos or add one.
+        if self.tokenizer.pad_token_id is None:
+            if self.tokenizer.eos_token_id is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                # last resort: add a [PAD] token and resize embeddings
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                self.model.resize_token_embeddings(len(self.tokenizer))
 
     # ---------- memory handling (same idea as original Agent) ----------
 
@@ -92,7 +126,7 @@ class HFLocalAgent:
                 max_new_tokens=max_tokens,
                 do_sample=(temperature > 0),
                 temperature=temperature,
-                pad_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
             )
 
         # cut off the prompt part
@@ -103,7 +137,6 @@ class HFLocalAgent:
     def ask(self, temperature: float = None):
         """
         Same interface as original Agent.ask, but uses HF token counting.
-        You can approximate tokens or re-use num_tokens_from_string if you want.
         """
         if temperature is None:
             temperature = self.temperature
@@ -112,9 +145,13 @@ class HFLocalAgent:
         all_text = "".join(m["content"] for m in self.memory_lst)
         num_context_token = len(self.tokenizer.tokenize(all_text))
 
-        # use model config if you don't have model2max_context
-        max_context = getattr(
-            self.model.config, "max_position_embeddings", 4096)
-        max_new = max(16, max_context - num_context_token - 32)  # keep margin
+        # use model config if available
+        max_context = getattr(self.model.config, "max_position_embeddings", 4096)
+
+        # HARD CAP for max_new_tokens (tune this!)
+        hard_cap = 256  # or 128, 512, etc.
+
+        max_new = max(16, max_context - num_context_token - 32)
+        max_new = min(max_new, hard_cap)  # <- enforce cap
 
         return self.query(self.memory_lst, max_tokens=max_new, temperature=temperature)

@@ -84,6 +84,19 @@ def parse_model_dict(text: str) -> dict:
         except Exception as e:
             raise ValueError(f"Could not parse model output:\n{text}\n\nError: {e}")
 
+def safe_parse_model_dict(text: str):
+    """
+    Wrap parse_model_dict, but never crash the program.
+    If parsing fails, log a warning and return None.
+    The caller can treat this as 'no preference' and skip the debate.
+    """
+    try:
+        return parse_model_dict(text)
+    except ValueError as e:
+        print("WARNING: Failed to parse model JSON output, will skip this debate.")
+        print(e)
+        return None
+
 
 class TeeOutput:
     """A class to write output to multiple streams simultaneously"""
@@ -170,6 +183,7 @@ class Debate:
 
         # Initialize output capture
         self.output_buffer = StringIO()
+        self.debate_only_buffer = StringIO()  # For debate-only content
         self.original_stdout = sys.stdout
 
         # Start capturing output immediately
@@ -222,15 +236,23 @@ class Debate:
 
         # start: first round debate, state opinions
         print(f"===== Debate Round-1 =====\n")
+        self.debate_only_buffer.write(f"===== Debate Round-1 =====\n\n")
+        
         self.affirmative.add_event(self.config['affirmative_prompt'])
         self.aff_ans = self.affirmative.ask()
         self.affirmative.add_memory(self.aff_ans)
         self.config['base_answer'] = self.aff_ans
+        
+        # Save to debate-only buffer (matching print format)
+        self.debate_only_buffer.write(f"----- {self.affirmative.name} -----\n{self.aff_ans}\n\n")
 
         self.negative.add_event(
             self.config['negative_prompt'].replace('##aff_ans##', self.aff_ans))
         self.neg_ans = self.negative.ask()
         self.negative.add_memory(self.neg_ans)
+        
+        # Save to debate-only buffer (matching print format)
+        self.debate_only_buffer.write(f"----- {self.negative.name} -----\n{self.neg_ans}\n\n")
 
         self.moderator.add_event(
             self.config['moderator_prompt']
@@ -240,7 +262,7 @@ class Debate:
         )
         mod_raw = self.moderator.ask()
         self.moderator.add_memory(mod_raw)
-        self.mod_ans = parse_model_dict(mod_raw)
+        self.mod_ans = safe_parse_model_dict(mod_raw)
 
     def round_dct(self, num: int):
         dct = {
@@ -266,19 +288,30 @@ class Debate:
         """Save debate results to a file in the results directory"""
         # Create filename from debate topic using a safe helper
         filename = topic_to_filename(self.config["debate_topic"])
-        filepath = os.path.join(RESULTS_DIR, filename)
-
+        filepath = os.path.join(RESULTS_DIR, "with_answer", filename)
+        
+        # Create debate-only filename
+        debate_only_filename = topic_to_filename(self.config["debate_topic"])
+        debate_only_filepath = os.path.join(RESULTS_DIR, "debate_only", debate_only_filename)
         # Ensure the results directory exists
-        os.makedirs(RESULTS_DIR, exist_ok=True)
+        os.makedirs(os.path.join(RESULTS_DIR, "with_answer"), exist_ok=True)
+        os.makedirs(os.path.join(RESULTS_DIR, "debate_only"), exist_ok=True)
 
-        # Get all captured output
+        # Get all captured output (full version)
         all_output = self.output_buffer.getvalue()
 
-        # Write all output to file
+        # Write full output to file
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(all_output)
 
+        # Write debate-only output to file (without summary)
+        debate_only_output = self.debate_only_buffer.getvalue()
+        
+        with open(debate_only_filepath, 'w', encoding='utf-8') as f:
+            f.write(debate_only_output)
+
         print(f"\nResults saved to: {filepath}")
+        print(f"Debate-only results saved to: {debate_only_filepath}")
 
     def broadcast(self, msg: str):
         """Broadcast a message to all players. 
@@ -316,6 +349,7 @@ class Debate:
 
         for round in range(self.max_round - 1):
             print(f"===== Debate Round-{round+2} =====\n")
+            self.debate_only_buffer.write(f"===== Debate Round-{round+2} =====\n\n")
 
             # Affirmative responds to the opponent's latest answer
             self.affirmative.add_event(
@@ -323,6 +357,9 @@ class Debate:
             )
             self.aff_ans = self.affirmative.ask()
             self.affirmative.add_memory(self.aff_ans)
+            
+            # Save to debate-only buffer (matching print format)
+            self.debate_only_buffer.write(f"----- {self.affirmative.name} -----\n{self.aff_ans}\n\n")
 
             # Negative responds to the opponent's latest answer
             self.negative.add_event(
@@ -330,6 +367,9 @@ class Debate:
             )
             self.neg_ans = self.negative.ask()
             self.negative.add_memory(self.neg_ans)
+            
+            # Save to debate-only buffer (matching print format)
+            self.debate_only_buffer.write(f"----- {self.negative.name} -----\n{self.neg_ans}\n\n")
 
             # Moderator comments on this round
             self.moderator.add_event(
@@ -342,7 +382,7 @@ class Debate:
             self.moderator.add_memory(mod_raw)
 
             # Parse moderator output but DO NOT stop early
-            self.mod_ans = parse_model_dict(mod_raw)
+            self.mod_ans = safe_parse_model_dict(mod_raw)
 
         # ===== After all rounds are finished, we now decide the winner. =====
 
@@ -385,8 +425,19 @@ class Debate:
             final_raw = judge_player.ask()
             judge_player.add_memory(final_raw)
 
-            final_dict = parse_model_dict(final_raw)
+            # Try to parse; if fail, skip this debate
+            final_dict = safe_parse_model_dict(final_raw)
             self.players.append(judge_player)
+
+            if final_dict is None:
+                # Treat as no-preference debate and skip
+                print("\n\n===== Debate Skipped: JSON parse error in Judge output =====")
+                print("\n----- Debate Topic -----")
+                print(self.config["debate_topic"])
+
+                # Restore stdout before returning
+                sys.stdout = self.original_stdout
+                return False
 
         if final_dict is not None:
             self.config.update(final_dict)
@@ -428,7 +479,7 @@ if __name__ == "__main__":
 
     debate_ids = list(conversations.keys())   # use ALL topics, not just [:25]
 
-    TOTAL_NEEDED = 25
+    TOTAL_NEEDED = 30
     completed = 0     # number of debates with a preference (and saved)
     cursor = 0        # index into debate_ids
 
@@ -462,8 +513,8 @@ if __name__ == "__main__":
             max_round=3,
             model_names={
                 # HF model IDs here
-                "Affirmative side": "meta-llama/Llama-3.1-8B-Instruct",
-                "Negative side": "dkang33/HAI_debate-dishonest_llama_3.1_8b_instruct",
+                "Affirmative side": "dkang33/HAI_debate-dishonest_llama_3.1_8b_instruct",
+                "Negative side": "meta-llama/Llama-3.1-8B-Instruct",
                 "Moderator": "google/gemma-2-9b-it",
                 "Judge": "google/gemma-2-9b-it",
             }

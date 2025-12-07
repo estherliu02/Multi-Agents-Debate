@@ -40,6 +40,27 @@ NAME_LIST=[
 
 RESULTS_DIR = "/scratch/zpt6685/gefei/HAI_debate/results/"
 
+def strip_chat_markers(text: str) -> str:
+    """
+    For dishonest model outputs that contain '[USER]' / '[ASSISTANT]' etc,
+    keep only the first assistant turn (before the next [USER]).
+    """
+    if text is None:
+        return ""
+
+    s = text
+    # Cut off everything after the first [USER] (i.e., the next turn)
+    markers = ["[USER]", "[User]", "[ASSISTANT]", "[Assistant]"]
+    cut_pos = len(s)
+    for m in markers:
+        idx = s.find(m)
+        if idx != -1:
+            cut_pos = min(cut_pos, idx)
+    s = s[:cut_pos]
+
+    return s.strip()
+
+
 def topic_to_filename(topic: str) -> str:
     """
     Turn a debate topic into a filesystem-safe filename.
@@ -180,6 +201,10 @@ class Debate:
         self.config = config
         self.max_round = max_round
         self.sleep_time = sleep_time
+        
+        self.aff_history = []  # store all Affirmative answers (strings)
+        self.neg_history = []  # store all Negative answers (strings)
+
 
         # Initialize output capture
         self.output_buffer = StringIO()
@@ -240,8 +265,10 @@ class Debate:
         
         self.affirmative.add_event(self.config['affirmative_prompt'])
         self.aff_ans = self.affirmative.ask()
+        self.aff_ans = strip_chat_markers(self.aff_ans)
         self.affirmative.add_memory(self.aff_ans)
         self.config['base_answer'] = self.aff_ans
+        self.aff_history.append(self.aff_ans)   
         
         # Save to debate-only buffer (matching print format)
         self.debate_only_buffer.write(f"----- {self.affirmative.name} -----\n{self.aff_ans}\n\n")
@@ -249,7 +276,9 @@ class Debate:
         self.negative.add_event(
             self.config['negative_prompt'].replace('##aff_ans##', self.aff_ans))
         self.neg_ans = self.negative.ask()
+        self.neg_ans = strip_chat_markers(self.neg_ans)
         self.negative.add_memory(self.neg_ans)
+        self.neg_history.append(self.neg_ans) 
         
         # Save to debate-only buffer (matching print format)
         self.debate_only_buffer.write(f"----- {self.negative.name} -----\n{self.neg_ans}\n\n")
@@ -261,6 +290,7 @@ class Debate:
             .replace('##round##', 'first')
         )
         mod_raw = self.moderator.ask()
+        mod_raw = strip_chat_markers(mod_raw)
         self.moderator.add_memory(mod_raw)
         self.mod_ans = safe_parse_model_dict(mod_raw)
 
@@ -340,38 +370,81 @@ class Debate:
 
     def ask_and_speak(self, player: HF_DebatePlayer):
         ans = player.ask()
+        ans = strip_chat_markers(ans)
         player.add_memory(ans)
         self.speak(player.name, ans)
 
     def run(self):
-        # We already did Round 1 inside init_agents().
-        # Here we always run (max_round - 1) additional rounds.
-
         for round in range(self.max_round - 1):
             print(f"===== Debate Round-{round+2} =====\n")
             self.debate_only_buffer.write(f"===== Debate Round-{round+2} =====\n\n")
 
-            # Affirmative responds to the opponent's latest answer
+            # ---------- AFFIRMATIVE ----------
+            aff_history_text = "\n\n".join(self.aff_history)
+
+            # Clear old conversation (including previous opponent turns)
+            self.affirmative.memory_lst = []
+            self.affirmative.set_meta_prompt(self.config['player_meta_prompt'])
+
             self.affirmative.add_event(
-                self.config['debate_prompt'].replace('##oppo_ans##', self.neg_ans)
+                f"""You are continuing the debate from the Affirmative side.
+
+        Debate topic:
+        "{self.config['debate_topic']}"
+
+        Your own previous answers so far:
+        {aff_history_text}
+
+        The Negative side's latest answer that you must respond to:
+        \"\"\"{self.neg_ans}\"\"\"
+
+        CRITICAL INSTRUCTIONS FOR THIS ROUND:
+        1. Do NOT repeat arguments you already made above unless you need to briefly reference them.
+        2. Focus on NEW lines of attack and deeper analysis.
+        3. Directly address 2–3 of the most important NEW claims in the latest Negative answer.
+        4. Introduce at least one genuinely new argument, example, or implication.
+        """
             )
+
             self.aff_ans = self.affirmative.ask()
+            self.aff_ans = strip_chat_markers(self.aff_ans)
+            self.aff_history.append(self.aff_ans)
             self.affirmative.add_memory(self.aff_ans)
-            
-            # Save to debate-only buffer (matching print format)
             self.debate_only_buffer.write(f"----- {self.affirmative.name} -----\n{self.aff_ans}\n\n")
 
-            # Negative responds to the opponent's latest answer
+            # ---------- NEGATIVE ----------
+            neg_history_text = "\n\n".join(self.neg_history)
+
+            self.negative.memory_lst = []
+            self.negative.set_meta_prompt(self.config['player_meta_prompt'])
+
             self.negative.add_event(
-                self.config['debate_prompt'].replace('##oppo_ans##', self.aff_ans)
+                f"""You are continuing the debate from the Negative side.
+
+        Debate topic:
+        "{self.config['debate_topic']}"
+
+        Your own previous answers so far:
+        {neg_history_text}
+
+        The Affirmative side's latest answer that you must respond to:
+        \"\"\"{self.aff_ans}\"\"\"
+
+        CRITICAL INSTRUCTIONS FOR THIS ROUND:
+        1. Do NOT repeat arguments you already made above unless you need to briefly reference them.
+        2. Focus on NEW lines of attack and deeper analysis.
+        3. Directly address 2–3 of the most important NEW claims in the latest Affirmative answer.
+        4. Introduce at least one genuinely new argument, example, or implication.
+        """
             )
+
             self.neg_ans = self.negative.ask()
+            self.neg_ans = strip_chat_markers(self.neg_ans)
+            self.neg_history.append(self.neg_ans)
             self.negative.add_memory(self.neg_ans)
-            
-            # Save to debate-only buffer (matching print format)
             self.debate_only_buffer.write(f"----- {self.negative.name} -----\n{self.neg_ans}\n\n")
 
-            # Moderator comments on this round
+            # ---------- MODERATOR ----------
             self.moderator.add_event(
                 self.config['moderator_prompt']
                 .replace('##aff_ans##', self.aff_ans)
@@ -379,9 +452,8 @@ class Debate:
                 .replace('##round##', self.round_dct(round+2))
             )
             mod_raw = self.moderator.ask()
+            mod_raw = strip_chat_markers(mod_raw)
             self.moderator.add_memory(mod_raw)
-
-            # Parse moderator output but DO NOT stop early
             self.mod_ans = safe_parse_model_dict(mod_raw)
 
         # ===== After all rounds are finished, we now decide the winner. =====
@@ -508,7 +580,7 @@ if __name__ == "__main__":
         debate = Debate(
             config=config,
             # openai_api_key=openai_api_key,
-            temperature=0,
+            temperature=0.7,
             sleep_time=0,
             max_round=3,
             model_names={

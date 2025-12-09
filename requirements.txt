@@ -10,3 +10,5 @@ accelerate
 safetensors
 sentencepiece
 protobuf
+datasets
+convokit
